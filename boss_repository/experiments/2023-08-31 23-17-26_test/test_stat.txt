@@ -1,0 +1,1 @@
+Max test classification loss:nan & Max test classification acc:0.21528533101081848

@@ -1,0 +1,234 @@
+TO TEST THE MODEL - THE FOLLOWING CONFIG ARE NEEDED TO BE FOLLOWED
+
+#CHANGE THE param.py AS PER THE BEST CONFIG TO MAKE THE MODEL WORK ON THE TEST SET.
+
+## INPUT 
+POSE_AS_INPUT = 'graph' #coordinates, graph, picture
+BBOX_AS_INPUT = 'new_coordinates' #old_coordinates, new_coordinates, picture
+USE_OCR_AS = 'input' #'input' cost_func
+SAVE_PATH = 'experiments/'
+
+SA_LOAD_MODEL_PATH = 'best_model/Self_Attention_Model' #POSE_AS_INPUT = "coordinates", BBOX_AS_INPUT='new_coordinates', USE_OCR_AS = 'input' - Runtime error otherwise
+CA_LOAD_MODEL_PATH = 'best_model/Hierarchical_Cross_Attention_Model' #POSE_AS_INPUT = "graph", BBOX_AS_INPUT='new_coordinates', USE_OCR_AS = 'input' - Runtime error otherwise
+
+## Models Parameters
+BATCH_SIZE = 32
+EPOCHS = 1
+LR = 0.0001
+WEIGHT_DECAY = "Not_Used"
+LAMBD = "Not_Used"
+VGG_LAYERS_BBOX =  [16, "M", 16]
+VGG_LAYERS_POSE = [16, "M", 8]
+VGG_LAYERS = [64, "M", 64, "M", 128, "M", 128]
+RESNET_LAYERS = [3,3,3,3]
+MODEL_NUM_LAYERS = 1
+MODEL_INPUT_DIM = 64
+MODEL_NUM_HEAD = 2
+MODEL_MLP_DIM = 128 #deals with FF after the MLA
+MODEL_REPRESENTATION_DIM = 256 #deals with FF after the MLA #64 for cnn+lstm
+MODEL_NUM_CLASSES = 27  
+MODEL_ORIGINAL_INPUT_LENGTH_METHOD_1 = 128+16+16+16+16
+MODEL_ORIGINAL_INPUT_LENGTH_METHOD_2 = 128+16+16+16+16 #if method2 is activated
+
+##CROSS ATTENNTION
+MODEL_ORIGINAL_INPUT_CA_LENGTH_METHOD_1 = 128+16+16
+
+## Architecture.py - CrossAttentionModel Class should follow the below class
+class CrossAttentionViT(nn.Module):
+    def __init__(
+        self,
+        original_hc_input_length,
+        original_oc_input_length,
+        num_layers,
+        num_heads,
+        input_dim,
+        mlp_dim,
+        representation_dim,
+        num_classes,
+        device,
+        is_ocr_cost_func,
+        dropout=0.2,
+        attention_dropout=0.1
+    ):
+        super(CrossAttentionViT, self).__init__()
+
+        self.input_channel = 3
+        
+        self.pose_bbox_inputs_dim = 8
+
+        self.pose_as_input = POSE_AS_INPUT
+
+        self.bbox_as_input = BBOX_AS_INPUT
+
+        self.pose_graph_edge_index = POSE_GRAPH_EDGE_INDEX
+
+        self.is_ocr_cost_func = is_ocr_cost_func
+
+        self.device = device
+
+        if self.is_ocr_cost_func == True:
+            logging.info("OCR as Cost Enabled")
+            original_oc_input_length = original_oc_input_length - 16
+
+        self.vgg = VGGBlock(
+            self.input_channel
+        )
+        
+        self.left_pose_graph = GATv2Conv(in_channels = 3, out_channels= 8, n_heads=3)
+
+        self.pose_left_avg_pool = nn.AdaptiveAvgPool2d((1, 8))
+        
+        self.left_pose_layers = VGGBlockPose()
+
+        self.right_pose_layers = VGGBlockPose()
+
+        # modality FFs
+        self.left_pose_ff = nn.Sequential(
+            nn.Linear(51, 8),
+            nn.ReLU(inplace=True),
+        )
+
+        self.right_pose_graph = GATv2Conv(in_channels = 3, out_channels= 8, n_heads=3)
+
+        self.pose_right_avg_pool = nn.AdaptiveAvgPool2d((1, 8))
+
+        self.right_pose_ff = nn.Sequential(
+            nn.Linear(51, 8),
+            nn.ReLU(inplace=True),
+        )
+        self.left_gaze_ff = nn.Sequential(
+            nn.Linear(3, 8),
+            nn.ReLU(inplace=True),
+        )
+        self.right_gaze_ff = nn.Sequential(
+            nn.Linear(3, 8),
+            nn.ReLU(inplace=True),
+        )
+
+        self.bbox_layers = VGGBlockBbox()
+
+        self.bbox_ff = nn.Sequential(
+            nn.Linear(108, 16),
+            nn.ReLU(inplace=True),
+        )
+        self.ocr_ff = nn.Sequential(
+            nn.Linear(729, 16),
+            nn.ReLU(inplace=True),
+        )
+        self.projection_mlp_hc = nn.Linear(
+            original_hc_input_length, input_dim
+        )
+        self.projection_mlp_oc = nn.Linear(
+            original_oc_input_length, input_dim
+        )
+        self.encoder_hc = SelfAttentionEncoder(
+            num_layers, num_heads, input_dim, mlp_dim, dropout, attention_dropout
+        )
+        self.encoder_oc = SelfAttentionEncoder(
+            num_layers, num_heads, input_dim, mlp_dim, dropout, attention_dropout
+        )
+        self.decoder =  CrossAttentionDecoder(
+            num_layers, num_heads, input_dim, mlp_dim, dropout, attention_dropout
+        )
+        left_heads_layers = OrderedDict()
+        left_heads_layers["pre_logits"] = nn.Linear(input_dim, representation_dim)
+        left_heads_layers["dropout"] = nn.Dropout(dropout)
+        left_heads_layers["act"] = nn.ReLU()
+        left_heads_layers["head"] = nn.Linear(representation_dim, num_classes)
+
+        right_heads_layers = OrderedDict()
+        right_heads_layers["pre_logits"] = nn.Linear(input_dim, representation_dim)
+        right_heads_layers["dropout"] = nn.Dropout(dropout)
+        right_heads_layers["act"] = nn.ReLU()
+        right_heads_layers["head"] = nn.Linear(representation_dim, num_classes)
+
+        ocr_head_layers = OrderedDict()
+        ocr_head_layers["head"] = nn.Linear(input_dim, 1)
+        ocr_head_layers["act"] = nn.Sigmoid()
+
+
+        self.left_beliefs_heads = nn.Sequential(left_heads_layers)
+        self.right_beliefs_heads = nn.Sequential(right_heads_layers)
+        self.ocr_head = nn.Sequential(ocr_head_layers)
+
+    def forward(self, images, left_poses, right_poses,  left_gazes, right_gazes, bboxes, ocr_tensor):
+        #image_feat = self.resnet(images.to(self.device))
+        image_feat_hc = self.vgg(images.to(self.device))
+        image_feat_oc = self.vgg(images.to(self.device))
+
+        if self.pose_as_input == "coordinates":
+            left_poses_feat = self.left_pose_ff(left_poses.to(self.device))
+            image_feat_hc = torch.cat([image_feat_hc, left_poses_feat], 1)
+
+        elif self.pose_as_input == "graph":
+            bs, l, c = left_poses.shape
+            left_pose = self.left_pose_graph(left_poses.to(self.device).view(-1, c), self.pose_graph_edge_index.to(self.device))
+            left_poses_feat = torch.squeeze(self.pose_left_avg_pool(left_pose.view(bs, l, self.pose_bbox_inputs_dim)))
+            image_feat_hc = torch.cat([image_feat_hc, left_poses_feat.to(self.device)], 1)
+        
+        elif self.pose_as_input == "picture":
+            left_poses_feat = self.left_pose_layers(left_poses.to(self.device))
+            image_feat_hc = torch.cat([image_feat_hc, left_poses_feat], 1)
+
+        if self.pose_as_input == "coordinates":
+            right_poses_feat = self.right_pose_ff(right_poses.to(self.device))
+            image_feat_hc = torch.cat([image_feat_hc, right_poses_feat], 1)
+
+        elif self.pose_as_input == "graph":
+            bs, l, c = right_poses.shape
+            right_pose = self.right_pose_graph(right_poses.to(self.device).view(-1, c), self.pose_graph_edge_index.to(self.device))
+            right_poses_feat = torch.squeeze(self.pose_right_avg_pool(right_pose.view(bs, l, self.pose_bbox_inputs_dim)))
+            image_feat_hc = torch.cat([image_feat_hc, right_poses_feat.to(self.device)], 1)
+
+        elif self.pose_as_input == "picture":
+            #logging.info("Right pose - {}".format(right_poses.shape))
+            right_poses_feat = self.right_pose_layers(right_poses.to(self.device))
+            image_feat_hc = torch.cat([image_feat_hc, right_poses_feat], 1)
+
+        if left_gazes is not None:
+            left_gazes_feat = self.left_gaze_ff(left_gazes.to(self.device))
+            image_feat_hc = torch.cat([image_feat_hc, left_gazes_feat], 1)
+        
+        if right_gazes is not None:
+            right_gazes_feat = self.right_gaze_ff(right_gazes.to(self.device))
+            image_feat_hc = torch.cat([image_feat_hc, right_gazes_feat], 1)
+
+        if self.bbox_as_input == "new_coordinates" or self.bbox_as_input == "old_coordinates":
+            #logging.info(bboxes.shape)
+            ## BBOX AS COORDINATES
+            bboxes_feat = self.bbox_ff(bboxes.to(self.device))
+            image_feat_oc = torch.cat([image_feat_oc, bboxes_feat], 1)
+        
+        elif self.bbox_as_input == "picture":
+            bboxes_feat = self.bbox_layers(bboxes.to(self.device))
+            image_feat_oc = torch.cat([image_feat_oc, bboxes_feat], 1)
+
+        if self.is_ocr_cost_func == False:
+            #logging.info("OCR as Input Skipped")
+            ocr_tensor_feat = self.ocr_ff(ocr_tensor.to(self.device))
+            image_feat_oc = torch.cat([image_feat_oc, ocr_tensor_feat], 1)
+        
+        #PROJECTION
+        # logging.info(image_feat_hc.shape)
+        proj_inp_hc  = self.projection_mlp_hc(image_feat_hc)
+        proj_inp_oc  = self.projection_mlp_oc(image_feat_oc)
+
+        #SELF ATTENTION ENCODER
+        # logging.info(proj_inp_hc.shape)
+        self_att_encoder_hc = self.encoder_hc(proj_inp_hc)
+        self_att_encoder_oc = self.encoder_oc(proj_inp_oc)
+        
+        #CROSS ATTENTION ENCODER
+        cross_att_decoder = self.decoder(self_att_encoder_hc, self_att_encoder_oc)
+        
+        #MLP HEAD
+        left_beliefs = self.left_beliefs_heads(cross_att_decoder)
+        right_beliefs = self.right_beliefs_heads(cross_att_decoder)
+
+        if self.is_ocr_cost_func == True:
+            logging.info("OCR as final layer")
+            ocr_out = self.ocr_head(cross_att_decoder)
+        else:
+            ocr_out = 0
+
+        return left_beliefs, right_beliefs, ocr_out

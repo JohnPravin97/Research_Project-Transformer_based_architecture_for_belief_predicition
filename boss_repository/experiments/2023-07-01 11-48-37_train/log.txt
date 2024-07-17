@@ -1,0 +1,2 @@
+{'train': {'cls_loss': [5.822343587875366, 3.341630697250366], 'cls_acc': [tensor(0.0833, device='cuda:0'), tensor(0.0833, device='cuda:0')]}, 'val': {'cls_loss': [6.947815794853648, 7.98113531367794], 'cls_acc': [tensor(0., device='cuda:0'), tensor(0., device='cuda:0')]}}
+Max val classification acc: epoch 2, 0.0

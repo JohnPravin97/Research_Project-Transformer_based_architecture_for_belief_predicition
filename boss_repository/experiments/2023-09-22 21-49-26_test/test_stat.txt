@@ -1,0 +1,1 @@
+Max test classification loss:6.663876533508301 & Max test classification acc:0.3006114065647125
